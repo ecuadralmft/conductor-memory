@@ -11,8 +11,8 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("memory")
 
-TIERS = ("project", "decisions", "learnings", "active", "glossary")
-APPEND_ONLY = ("decisions", "learnings", "glossary")
+TIERS = ("project", "decisions", "learnings", "active", "glossary", "blockers")
+APPEND_ONLY = ("decisions", "learnings", "glossary", "blockers")
 ENTRY_SEPARATOR = "\n\n---\n\n"
 MAX_LINES_BEFORE_COMPACT_WARNING = 500
 
@@ -287,13 +287,21 @@ def memory_compact(
     _backup(tier, mem_dir)
 
     if strategy == "dedup":
-        seen = set()
+        seen: dict[str, dict] = {}
         unique = []
         for e in entries:
             key = e["body"].strip().lower()
             if key not in seen:
-                seen.add(key)
+                seen[key] = e
                 unique.append(e)
+            else:
+                # Merge tags from duplicate into the kept entry
+                existing = seen[key]
+                merged_tags = list(set(existing["tags"]) | set(e["tags"]))
+                if merged_tags != existing["tags"]:
+                    existing["tags"] = merged_tags
+                    # Rebuild raw with merged tags
+                    existing["raw"] = _format_entry(existing["body"], merged_tags, existing.get("source"))
         entries = unique
 
     elif strategy == "prune_older_than":
@@ -412,10 +420,10 @@ def discover_tools(force: bool = False) -> dict:
             return [t["name"] for t in data["result"]["tools"]]
         return []
 
-    for name, conf in servers.items():
+    def _probe_server(name: str, conf: dict) -> tuple[str, list[str] | None, str | None]:
+        """Probe a single server, return (name, tool_names, error)."""
         if name == "memory":
-            all_tools[name] = ["memory_read", "memory_write", "memory_search", "memory_compact", "memory_status", "discover_tools"]
-            continue
+            return name, ["memory_read", "memory_write", "memory_search", "memory_compact", "memory_status", "discover_tools"], None
 
         if "url" in conf:
             try:
@@ -433,10 +441,9 @@ def discover_tools(force: bool = False) -> dict:
                         if line.startswith("data: "):
                             names = _extract_names(json.loads(line[6:]))
                             if names:
-                                all_tools[name] = names
-                                break
+                                return name, names, None
             except Exception as e:
-                errors[name] = str(e)
+                return name, None, str(e)
 
         elif "command" in conf:
             try:
@@ -447,12 +454,24 @@ def discover_tools(force: bool = False) -> dict:
                     try:
                         names = _extract_names(json.loads(line))
                         if names:
-                            all_tools[name] = names
-                            break
+                            return name, names, None
                     except json.JSONDecodeError:
                         continue
             except Exception as e:
-                errors[name] = str(e)
+                return name, None, str(e)
+
+        return name, None, "Unknown server type"
+
+    # Probe all servers in parallel
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(servers)) as pool:
+        futures = [pool.submit(_probe_server, n, c) for n, c in servers.items()]
+        for future in futures:
+            sname, tools, err = future.result()
+            if tools:
+                all_tools[sname] = tools
+            if err:
+                errors[sname] = err
 
     total = sum(len(t) for t in all_tools.values())
     result = {
