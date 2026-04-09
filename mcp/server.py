@@ -2,13 +2,10 @@
 
 import fcntl
 import json
-import os
 import re
 import shutil
-import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,8 +40,6 @@ def _memory_dir(path: str | None = None) -> Path:
     # Global fallback: ~/.kiro/memory/
     d = Path.home() / ".kiro" / "memory"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "backups").mkdir(exist_ok=True)
-    return d
     (d / "backups").mkdir(exist_ok=True)
     return d
 
@@ -108,6 +103,7 @@ def _write_with_lock(path: Path, content: str, mode: str = "w") -> None:
     with open(path, mode) as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         f.write(content)
+        f.flush()
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
@@ -251,10 +247,9 @@ def memory_search(
         content = _read_tier(tier, mem_dir)
         if not content:
             continue
-        for i, line in enumerate(content.splitlines(), 1):
+        lines = content.splitlines()
+        for i, line in enumerate(lines, 1):
             if pattern.search(line):
-                # Get surrounding context
-                lines = content.splitlines()
                 start = max(0, i - 3)
                 end = min(len(lines), i + 2)
                 ctx = "\n".join(lines[start:end])
@@ -387,14 +382,17 @@ def discover_tools(force: bool = False) -> dict:
 
     # Return cache if mcp.json unchanged
     if not force and cache_path.exists():
-        cached = json.loads(cache_path.read_text())
-        if cached.get("config_hash") == config_hash:
-            return {
-                "cached": True,
-                "servers": cached["servers"],
-                "total_tools": cached["total_tools"],
-                "discovered_at": cached["discovered_at"],
-            }
+        try:
+            cached = json.loads(cache_path.read_text())
+            if cached.get("config_hash") == config_hash:
+                return {
+                    "cached": True,
+                    "servers": cached["servers"],
+                    "total_tools": cached["total_tools"],
+                    "discovered_at": cached["discovered_at"],
+                }
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass  # Corrupted cache, re-probe
 
     cfg = json.loads(mcp_content)
     servers = cfg.get("mcpServers", {})
@@ -485,8 +483,6 @@ def discover_tools(force: bool = False) -> dict:
         "errors": errors if errors else None,
         "discovered_at": result["discovered_at"],
     }
-
-    return summary
 
 
 if __name__ == "__main__":
