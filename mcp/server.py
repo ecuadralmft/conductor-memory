@@ -351,5 +351,127 @@ def memory_status() -> dict:
     return {"tiers": tier_info, "total_size_bytes": total, "memory_dir": str(mem_dir)}
 
 
+@mcp.tool()
+def discover_tools() -> dict:
+    """Discover all MCP tools available in this workspace by reading mcp.json and probing each server.
+
+    Probes stdio servers by launching them and sending initialize + tools/list.
+    Probes HTTP servers by sending HTTP requests.
+    Updates the project memory tier with the current tool inventory.
+    """
+    import subprocess as _sp
+
+    mcp_json = Path.home() / ".kiro" / "settings" / "mcp.json"
+    if not mcp_json.exists():
+        return {"error": "No mcp.json found at ~/.kiro/settings/mcp.json"}
+
+    cfg = json.loads(mcp_json.read_text())
+    servers = cfg.get("mcpServers", {})
+    all_tools: dict[str, list[dict]] = {}
+    errors: dict[str, str] = {}
+
+    init_msg = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "discover", "version": "1.0"}}
+    })
+    notif_msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    list_msg = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+
+    for name, conf in servers.items():
+        # Skip self
+        if name == "memory":
+            all_tools[name] = [
+                {"name": "memory_read", "description": "Read from workspace memory"},
+                {"name": "memory_write", "description": "Write to workspace memory"},
+                {"name": "memory_search", "description": "Search across memory tiers"},
+                {"name": "memory_compact", "description": "Compact a memory tier"},
+                {"name": "memory_status", "description": "Get memory tier health"},
+                {"name": "discover_tools", "description": "Discover all available MCP tools"},
+            ]
+            continue
+
+        if "url" in conf:
+            # HTTP server
+            try:
+                import urllib.request
+                url = conf["url"]
+                headers = {"Content-Type": "application/json",
+                           "Accept": "application/json, text/event-stream"}
+                # Initialize
+                req = urllib.request.Request(url, data=init_msg.encode(), headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read().decode()
+                    session_id = resp.headers.get("Mcp-Session-Id", "")
+                # Send initialized + tools/list
+                if session_id:
+                    headers["Mcp-Session-Id"] = session_id
+                req2 = urllib.request.Request(url, data=notif_msg.encode(), headers=headers, method="POST")
+                urllib.request.urlopen(req2, timeout=5)
+                req3 = urllib.request.Request(url, data=list_msg.encode(), headers=headers, method="POST")
+                with urllib.request.urlopen(req3, timeout=15) as resp3:
+                    body3 = resp3.read().decode()
+                # Parse SSE data
+                for line in body3.splitlines():
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if "result" in data and "tools" in data["result"]:
+                            all_tools[name] = [
+                                {"name": t["name"], "description": t["description"].split("\n")[0]}
+                                for t in data["result"]["tools"]
+                            ]
+                            break
+            except Exception as e:
+                errors[name] = str(e)
+
+        elif "command" in conf:
+            # Stdio server
+            try:
+                cmd = [conf["command"]] + conf.get("args", [])
+                stdin_data = f"{init_msg}\n{notif_msg}\n{list_msg}\n"
+                proc = _sp.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=15)
+                for line in proc.stdout.strip().splitlines():
+                    try:
+                        data = json.loads(line)
+                        if "result" in data and "tools" in data["result"]:
+                            all_tools[name] = [
+                                {"name": t["name"], "description": t["description"].split("\n")[0]}
+                                for t in data["result"]["tools"]
+                            ]
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            except Exception as e:
+                errors[name] = str(e)
+
+    # Build summary
+    total = sum(len(tools) for tools in all_tools.values())
+    summary = {
+        "servers": {name: len(tools) for name, tools in all_tools.items()},
+        "total_tools": total,
+        "tools_by_server": all_tools,
+        "errors": errors,
+        "discovered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Auto-update project memory with tool inventory
+    mem_dir = _memory_dir()
+    inventory_lines = [f"## MCP Tool Inventory (auto-discovered {datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n"]
+    inventory_lines.append(f"Total: {total} tools across {len(all_tools)} servers\n")
+    for sname, tools in all_tools.items():
+        inventory_lines.append(f"\n### {sname} ({len(tools)} tools)")
+        for t in tools:
+            inventory_lines.append(f"- {t['name']}: {t['description']}")
+    if errors:
+        inventory_lines.append(f"\n### Errors")
+        for sname, err in errors.items():
+            inventory_lines.append(f"- {sname}: {err}")
+
+    inventory_path = mem_dir / "tool-inventory.md"
+    _write_with_lock(inventory_path, "\n".join(inventory_lines) + "\n")
+
+    return summary
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
