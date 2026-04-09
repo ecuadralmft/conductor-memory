@@ -21,9 +21,15 @@ MAX_LINES_BEFORE_COMPACT_WARNING = 500
 
 
 def _memory_dir(path: str | None = None) -> Path:
-    """Resolve memory directory: conductor/memory/ at workspace root."""
+    """Resolve memory directory.
+
+    Resolution order:
+    1. Walk up from path/cwd to find existing conductor/memory/
+    2. Walk up to find .git or .kiro and create conductor/memory/ there
+    3. Fall back to ~/.kiro/memory/ (global, always available)
+    """
     start = Path(path).resolve() if path else Path.cwd().resolve()
-    # Walk up to find conductor/ or workspace root
+    # Walk up to find existing conductor/memory/ or a workspace root
     cur = start
     while cur != cur.parent:
         if (cur / "conductor" / "memory").exists():
@@ -34,8 +40,11 @@ def _memory_dir(path: str | None = None) -> Path:
             (d / "backups").mkdir(exist_ok=True)
             return d
         cur = cur.parent
-    d = start / "conductor" / "memory"
+    # Global fallback: ~/.kiro/memory/
+    d = Path.home() / ".kiro" / "memory"
     d.mkdir(parents=True, exist_ok=True)
+    (d / "backups").mkdir(exist_ok=True)
+    return d
     (d / "backups").mkdir(exist_ok=True)
     return d
 
