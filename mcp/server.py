@@ -130,21 +130,27 @@ def memory_read(
     tier: str,
     search: str | None = None,
     last_n: int | None = None,
+    brief: bool = False,
 ) -> dict:
-    """Read from workspace memory. Tiers: project, decisions, learnings, active, glossary, all."""
+    """Read from workspace memory. Tiers: project, decisions, learnings, active, glossary, all. Set brief=True for compact summaries (saves context window)."""
     mem_dir = _memory_dir()
 
     if tier == "all":
         combined = {}
         for t in TIERS:
             content = _read_tier(t, mem_dir)
-            if content.strip():
-                entries = _parse_entries(content) if t in APPEND_ONLY else []
+            if not content.strip():
+                continue
+            entries = _parse_entries(content) if t in APPEND_ONLY else []
+            count = len(entries) if entries else 1
+            if brief:
+                combined[t] = {"entries": count, "bytes": len(content)}
+            else:
                 combined[t] = {
                     "content": content[:2000] + ("..." if len(content) > 2000 else ""),
-                    "entries_count": len(entries) if entries else (1 if content.strip() else 0),
+                    "entries_count": count,
                 }
-        return {"tier": "all", "tiers": combined, "last_updated": datetime.now(timezone.utc).isoformat()}
+        return {"tier": "all", "tiers": combined}
 
     if tier not in TIERS:
         return {"error": f"Unknown tier: {tier}. Valid: {', '.join(TIERS)}, all"}
@@ -166,13 +172,24 @@ def memory_read(
         entries = entries[-last_n:]
         content = ENTRY_SEPARATOR.join(e["raw"] for e in entries)
 
+    count = len(entries) if entries else (1 if content.strip() else 0)
+
+    if brief:
+        # Return just entry count and last entry preview
+        preview = ""
+        if entries:
+            preview = entries[-1]["body"][:100]
+        elif content.strip():
+            preview = content.strip()[:100]
+        return {"tier": tier, "entries": count, "preview": preview}
+
     p = _tier_path(tier, mem_dir)
     last_mod = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat() if p.exists() else None
 
     return {
         "tier": tier,
         "content": content,
-        "entries_count": len(entries) if entries else (1 if content.strip() else 0),
+        "entries_count": count,
         "last_updated": last_mod,
     }
 
@@ -352,22 +369,36 @@ def memory_status() -> dict:
 
 
 @mcp.tool()
-def discover_tools() -> dict:
-    """Discover all MCP tools available in this workspace by reading mcp.json and probing each server.
-
-    Probes stdio servers by launching them and sending initialize + tools/list.
-    Probes HTTP servers by sending HTTP requests.
-    Updates the project memory tier with the current tool inventory.
-    """
+def discover_tools(force: bool = False) -> dict:
+    """Discover all MCP tools. Uses cached result if mcp.json hasn't changed since last probe. Set force=True to re-probe."""
+    import hashlib
     import subprocess as _sp
 
     mcp_json = Path.home() / ".kiro" / "settings" / "mcp.json"
     if not mcp_json.exists():
-        return {"error": "No mcp.json found at ~/.kiro/settings/mcp.json"}
+        return {"error": "No mcp.json found"}
 
-    cfg = json.loads(mcp_json.read_text())
+    mcp_content = mcp_json.read_text()
+    config_hash = hashlib.md5(mcp_content.encode()).hexdigest()
+
+    mem_dir = _memory_dir()
+    cache_path = mem_dir / "tool-inventory.json"
+    inventory_path = mem_dir / "tool-inventory.md"
+
+    # Return cache if mcp.json unchanged
+    if not force and cache_path.exists():
+        cached = json.loads(cache_path.read_text())
+        if cached.get("config_hash") == config_hash:
+            return {
+                "cached": True,
+                "servers": cached["servers"],
+                "total_tools": cached["total_tools"],
+                "discovered_at": cached["discovered_at"],
+            }
+
+    cfg = json.loads(mcp_content)
     servers = cfg.get("mcpServers", {})
-    all_tools: dict[str, list[dict]] = {}
+    all_tools: dict[str, list[str]] = {}
     errors: dict[str, str] = {}
 
     init_msg = json.dumps({
@@ -378,97 +409,82 @@ def discover_tools() -> dict:
     notif_msg = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
     list_msg = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 
+    def _extract_names(data: dict) -> list[str]:
+        if "result" in data and "tools" in data["result"]:
+            return [t["name"] for t in data["result"]["tools"]]
+        return []
+
     for name, conf in servers.items():
-        # Skip self
         if name == "memory":
-            all_tools[name] = [
-                {"name": "memory_read", "description": "Read from workspace memory"},
-                {"name": "memory_write", "description": "Write to workspace memory"},
-                {"name": "memory_search", "description": "Search across memory tiers"},
-                {"name": "memory_compact", "description": "Compact a memory tier"},
-                {"name": "memory_status", "description": "Get memory tier health"},
-                {"name": "discover_tools", "description": "Discover all available MCP tools"},
-            ]
+            all_tools[name] = ["memory_read", "memory_write", "memory_search", "memory_compact", "memory_status", "discover_tools"]
             continue
 
         if "url" in conf:
-            # HTTP server
             try:
                 import urllib.request
                 url = conf["url"]
-                headers = {"Content-Type": "application/json",
-                           "Accept": "application/json, text/event-stream"}
-                # Initialize
-                req = urllib.request.Request(url, data=init_msg.encode(), headers=headers, method="POST")
+                hdrs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+                req = urllib.request.Request(url, data=init_msg.encode(), headers=hdrs, method="POST")
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    body = resp.read().decode()
                     session_id = resp.headers.get("Mcp-Session-Id", "")
-                # Send initialized + tools/list
                 if session_id:
-                    headers["Mcp-Session-Id"] = session_id
-                req2 = urllib.request.Request(url, data=notif_msg.encode(), headers=headers, method="POST")
-                urllib.request.urlopen(req2, timeout=5)
-                req3 = urllib.request.Request(url, data=list_msg.encode(), headers=headers, method="POST")
-                with urllib.request.urlopen(req3, timeout=15) as resp3:
-                    body3 = resp3.read().decode()
-                # Parse SSE data
-                for line in body3.splitlines():
-                    if line.startswith("data: "):
-                        data = json.loads(line[6:])
-                        if "result" in data and "tools" in data["result"]:
-                            all_tools[name] = [
-                                {"name": t["name"], "description": t["description"].split("\n")[0]}
-                                for t in data["result"]["tools"]
-                            ]
-                            break
+                    hdrs["Mcp-Session-Id"] = session_id
+                urllib.request.urlopen(urllib.request.Request(url, data=notif_msg.encode(), headers=hdrs, method="POST"), timeout=5)
+                with urllib.request.urlopen(urllib.request.Request(url, data=list_msg.encode(), headers=hdrs, method="POST"), timeout=15) as r3:
+                    for line in r3.read().decode().splitlines():
+                        if line.startswith("data: "):
+                            names = _extract_names(json.loads(line[6:]))
+                            if names:
+                                all_tools[name] = names
+                                break
             except Exception as e:
                 errors[name] = str(e)
 
         elif "command" in conf:
-            # Stdio server
             try:
                 cmd = [conf["command"]] + conf.get("args", [])
-                stdin_data = f"{init_msg}\n{notif_msg}\n{list_msg}\n"
-                proc = _sp.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=15)
+                proc = _sp.run(cmd, input=f"{init_msg}\n{notif_msg}\n{list_msg}\n",
+                               capture_output=True, text=True, timeout=15)
                 for line in proc.stdout.strip().splitlines():
                     try:
-                        data = json.loads(line)
-                        if "result" in data and "tools" in data["result"]:
-                            all_tools[name] = [
-                                {"name": t["name"], "description": t["description"].split("\n")[0]}
-                                for t in data["result"]["tools"]
-                            ]
+                        names = _extract_names(json.loads(line))
+                        if names:
+                            all_tools[name] = names
                             break
                     except json.JSONDecodeError:
                         continue
             except Exception as e:
                 errors[name] = str(e)
 
-    # Build summary
-    total = sum(len(tools) for tools in all_tools.values())
-    summary = {
-        "servers": {name: len(tools) for name, tools in all_tools.items()},
+    total = sum(len(t) for t in all_tools.values())
+    result = {
+        "config_hash": config_hash,
+        "servers": {n: len(t) for n, t in all_tools.items()},
         "total_tools": total,
         "tools_by_server": all_tools,
         "errors": errors,
         "discovered_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Auto-update project memory with tool inventory
-    mem_dir = _memory_dir()
-    inventory_lines = [f"## MCP Tool Inventory (auto-discovered {datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n"]
-    inventory_lines.append(f"Total: {total} tools across {len(all_tools)} servers\n")
-    for sname, tools in all_tools.items():
-        inventory_lines.append(f"\n### {sname} ({len(tools)} tools)")
-        for t in tools:
-            inventory_lines.append(f"- {t['name']}: {t['description']}")
-    if errors:
-        inventory_lines.append(f"\n### Errors")
-        for sname, err in errors.items():
-            inventory_lines.append(f"- {sname}: {err}")
+    # Cache the full result (for future fast lookups)
+    _write_with_lock(cache_path, json.dumps(result, indent=2))
 
-    inventory_path = mem_dir / "tool-inventory.md"
-    _write_with_lock(inventory_path, "\n".join(inventory_lines) + "\n")
+    # Write human-readable inventory (for agents that read memory files)
+    lines = [f"## MCP Tool Inventory ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n"]
+    lines.append(f"Total: {total} tools across {len(all_tools)} servers\n")
+    for sname, tools in all_tools.items():
+        lines.append(f"\n### {sname} ({len(tools)})")
+        lines.append(", ".join(tools))
+    _write_with_lock(inventory_path, "\n".join(lines) + "\n")
+
+    # Return slim response — just counts, not full tool lists
+    return {
+        "cached": False,
+        "servers": result["servers"],
+        "total_tools": total,
+        "errors": errors if errors else None,
+        "discovered_at": result["discovered_at"],
+    }
 
     return summary
 
