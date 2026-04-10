@@ -17,11 +17,19 @@ Conductor Memory gives AI agents persistent, structured memory that survives acr
 | `learnings` | Patterns, gotchas, agent notes | Append-only |
 | `active` | Last session state, next steps | Overwrite at session end |
 | `glossary` | Domain terms, abbreviations | Append-only |
+| `blockers` | What failed, why, what was tried | Append-only |
 
 ## Prerequisites
 
-- Python 3.10+
-- [Kiro CLI](https://github.com/aws/kiro-cli) (or any MCP client)
+- **Python 3.10+** — [python.org/downloads](https://www.python.org/downloads/)
+- **pip** — included with Python (used by install.sh to install the MCP SDK)
+- **[Kiro CLI](https://github.com/aws/kiro-cli)** (or any MCP-compatible client)
+
+### Python Dependencies (auto-installed)
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `mcp[cli]` | ≥1.0.0 | MCP SDK — server framework and stdio transport |
 
 ## Install
 
